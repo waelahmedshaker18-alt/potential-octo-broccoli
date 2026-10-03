@@ -1,0 +1,1514 @@
+# -*- coding: utf-8 -*-
+import sqlite3
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from datetime import datetime
+import os
+import platform
+import tempfile
+import shutil
+
+# =========================================================
+# WAEL SHAKER - STORE MANAGEMENT SYSTEM
+# نظام إدارة المحل - وائل شاكر
+# POS + BARCODE + USB SCANNER + 80mm RECEIPT
+# INVENTORY + DISCOUNT + REPORTS + BACKUP
+# =========================================================
+
+DB_FILE = "store.db"
+RECEIPT_WIDTH = 42
+
+# ---------------------------------------------------------
+# DATABASE
+# ---------------------------------------------------------
+conn = sqlite3.connect(DB_FILE)
+conn.row_factory = sqlite3.Row
+conn.execute("PRAGMA foreign_keys = ON")
+cur = conn.cursor()
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    barcode TEXT UNIQUE,
+    name TEXT NOT NULL,
+    cost REAL NOT NULL DEFAULT 0,
+    price REAL NOT NULL DEFAULT 0,
+    quantity INTEGER NOT NULL DEFAULT 0,
+    min_quantity INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS sales (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    invoice_no TEXT UNIQUE,
+    sale_date TEXT NOT NULL,
+    subtotal REAL NOT NULL,
+    discount REAL NOT NULL DEFAULT 0,
+    total REAL NOT NULL,
+    paid REAL NOT NULL,
+    change_amount REAL NOT NULL,
+    profit REAL NOT NULL DEFAULT 0
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS sale_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sale_id INTEGER NOT NULL,
+    product_id INTEGER NOT NULL,
+    barcode TEXT,
+    name TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    price REAL NOT NULL,
+    cost REAL NOT NULL,
+    total REAL NOT NULL,
+    FOREIGN KEY(sale_id) REFERENCES sales(id),
+    FOREIGN KEY(product_id) REFERENCES products(id)
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+)
+""")
+
+# Safe migration for databases created by older versions.
+def add_column_if_missing(table, column, definition):
+    cur.execute(f"PRAGMA table_info({table})")
+    columns = [row["name"] for row in cur.fetchall()]
+    if column not in columns:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+add_column_if_missing("products", "min_quantity", "INTEGER NOT NULL DEFAULT 0")
+add_column_if_missing("products", "created_at", "TEXT")
+
+add_column_if_missing("sales", "discount", "REAL NOT NULL DEFAULT 0")
+add_column_if_missing("sales", "total", "REAL NOT NULL DEFAULT 0")
+
+# Repair total for old invoices if necessary.
+cur.execute("UPDATE sales SET total=subtotal WHERE total IS NULL OR total=0")
+cur.execute("UPDATE products SET created_at=? WHERE created_at IS NULL OR created_at=''",
+            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),))
+
+conn.commit()
+
+
+# ---------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------
+def money(value):
+    try:
+        return f"{float(value):.2f}"
+    except Exception:
+        return "0.00"
+
+
+def safe_float(value):
+    try:
+        text = str(value).strip().replace(",", ".")
+        return float(text) if text else 0.0
+    except Exception:
+        return 0.0
+
+
+def safe_int(value):
+    try:
+        return int(float(str(value).strip().replace(",", ".")))
+    except Exception:
+        return 0
+
+
+def generate_invoice_no():
+    return datetime.now().strftime("%Y%m%d%H%M%S%f")[:-3]
+
+
+def clear_tree(tree):
+    for item in tree.get_children():
+        tree.delete(item)
+
+
+def center_window(win, width, height):
+    win.update_idletasks()
+    sw = win.winfo_screenwidth()
+    sh = win.winfo_screenheight()
+    x = max(0, (sw - width) // 2)
+    y = max(0, (sh - height) // 2)
+    win.geometry(f"{width}x{height}+{x}+{y}")
+
+
+def get_setting(key, default=""):
+    cur.execute("SELECT value FROM settings WHERE key=?", (key,))
+    row = cur.fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key, value):
+    cur.execute("""
+        INSERT INTO settings(key, value) VALUES(?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+    """, (key, str(value)))
+    conn.commit()
+
+
+def printer_name():
+    return get_setting("printer_name", "")
+
+
+def receipt_text(invoice_no, sale_date, items, subtotal, discount, total, paid,
+                 change, profit=None):
+    lines = []
+    shop_name = get_setting("shop_name", "نظام إدارة المحل")
+    owner_name = get_setting("owner_name", "وائل شاكر")
+    phone = get_setting("shop_phone", "")
+
+    lines.append(shop_name.center(RECEIPT_WIDTH))
+    lines.append(owner_name.center(RECEIPT_WIDTH))
+    if phone:
+        lines.append(phone.center(RECEIPT_WIDTH))
+    lines.append("-" * RECEIPT_WIDTH)
+    lines.append(f"فاتورة: {invoice_no}")
+    lines.append(f"التاريخ: {sale_date}")
+    lines.append("-" * RECEIPT_WIDTH)
+
+    for item in items:
+        name = str(item["name"])[:24]
+        lines.append(name)
+        lines.append(
+            f"{item['quantity']} x {money(item['price'])} = {money(item['total'])}"
+        )
+
+    lines.append("-" * RECEIPT_WIDTH)
+    lines.append(f"الإجمالي قبل الخصم: {money(subtotal)}")
+    lines.append(f"الخصم:              {money(discount)}")
+    lines.append(f"الإجمالي:            {money(total)}")
+    lines.append(f"المدفوع:             {money(paid)}")
+    lines.append(f"الباقي:              {money(change)}")
+    if profit is not None:
+        lines.append(f"الربح:               {money(profit)}")
+    lines.append("-" * RECEIPT_WIDTH)
+    lines.append("شكرًا لزيارتكم".center(RECEIPT_WIDTH))
+    return "\n".join(lines)
+
+
+def print_text_receipt(text, parent=None):
+    try:
+        if platform.system() == "Windows":
+            printer = printer_name()
+            if printer:
+                # Send raw text to the configured Windows printer.
+                try:
+                    import win32print
+                    handle = win32print.OpenPrinter(printer)
+                    try:
+                        job = win32print.StartDocPrinter(handle, 1, ("Store Receipt", None, "RAW"))
+                        try:
+                            win32print.StartPagePrinter(handle)
+                            data = ("\x1b\x40" + text + "\n\n\x1d\x56\x00").encode("cp1256", errors="replace")
+                            win32print.WritePrinter(handle, data)
+                            win32print.EndPagePrinter(handle)
+                        finally:
+                            win32print.EndDocPrinter(handle)
+                    finally:
+                        win32print.ClosePrinter(handle)
+                    return True, "تم إرسال الفاتورة إلى الطابعة."
+                except ImportError:
+                    pass
+                except Exception as e:
+                    return False, str(e)
+
+            fd, path = tempfile.mkstemp(suffix=".txt", text=True)
+            os.close(fd)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.startfile(path, "print")
+            return True, "تم إرسال الفاتورة للطباعة."
+
+        fd, path = tempfile.mkstemp(suffix=".txt", text=True)
+        os.close(fd)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return False, "تم تجهيز ملف الفاتورة. الطباعة المباشرة تحتاج إعداد الطابعة حسب نظام التشغيل."
+
+    except Exception as e:
+        return False, str(e)
+
+
+# ---------------------------------------------------------
+# MAIN WINDOW
+# ---------------------------------------------------------
+root = tk.Tk()
+root.title("نظام إدارة المحل - وائل شاكر")
+root.geometry("1220x760")
+root.minsize(1050, 680)
+root.configure(bg="#eef2f5")
+
+# ---------------------------------------------------------
+# STYLE
+# ---------------------------------------------------------
+style = ttk.Style()
+try:
+    style.theme_use("clam")
+except Exception:
+    pass
+
+style.configure("Treeview",
+                rowheight=30,
+                font=("Arial", 10),
+                background="white",
+                fieldbackground="white")
+style.configure("Treeview.Heading",
+                font=("Arial", 10, "bold"))
+style.configure("TButton",
+                font=("Arial", 10, "bold"),
+                padding=7)
+style.configure("TLabel", font=("Arial", 10))
+
+
+# ---------------------------------------------------------
+# PRODUCT MANAGEMENT
+# ---------------------------------------------------------
+barcode_var = tk.StringVar()
+name_var = tk.StringVar()
+cost_var = tk.StringVar()
+price_var = tk.StringVar()
+qty_var = tk.StringVar()
+min_qty_var = tk.StringVar(value="0")
+search_var = tk.StringVar()
+
+header = tk.Frame(root, bg="#1261a0", height=70)
+header.pack(fill="x")
+header.pack_propagate(False)
+
+tk.Label(header,
+         text="نظام إدارة المحل - وائل شاكر",
+         bg="#1261a0", fg="white",
+         font=("Arial", 22, "bold")).pack(expand=True)
+
+product_frame = tk.LabelFrame(
+    root, text="إدارة المنتجات",
+    font=("Arial", 12, "bold"),
+    bg="#eef2f5", padx=12, pady=10
+)
+product_frame.pack(fill="x", padx=12, pady=10)
+
+
+def product_clear():
+    barcode_var.set("")
+    name_var.set("")
+    cost_var.set("")
+    price_var.set("")
+    qty_var.set("")
+    min_qty_var.set("0")
+    product_tree.selection_remove(product_tree.selection())
+    barcode_entry.focus_set()
+
+
+def selected_product_id():
+    selected = product_tree.selection()
+    if not selected:
+        return None
+    try:
+        return int(product_tree.item(selected[0], "values")[0])
+    except Exception:
+        return None
+
+
+def load_product(event=None):
+    selected = product_tree.selection()
+    if not selected:
+        return
+    values = product_tree.item(selected[0], "values")
+    barcode_var.set(values[1])
+    name_var.set(values[2])
+    cost_var.set(values[3])
+    price_var.set(values[4])
+    qty_var.set(values[5])
+    min_qty_var.set(values[6])
+
+
+def refresh_products(search=""):
+    clear_tree(product_tree)
+    text = search.strip()
+    if text:
+        cur.execute("""
+            SELECT id, barcode, name, cost, price, quantity, min_quantity
+            FROM products
+            WHERE barcode LIKE ? OR name LIKE ?
+            ORDER BY id DESC
+        """, (f"%{text}%", f"%{text}%"))
+    else:
+        cur.execute("""
+            SELECT id, barcode, name, cost, price, quantity, min_quantity
+            FROM products ORDER BY id DESC
+        """)
+    for row in cur.fetchall():
+        tag = "low" if row["quantity"] <= row["min_quantity"] else ""
+        product_tree.insert("", "end", tags=(tag,), values=(
+            row["id"],
+            row["barcode"] or "",
+            row["name"],
+            money(row["cost"]),
+            money(row["price"]),
+            row["quantity"],
+            row["min_quantity"]
+        ))
+
+
+def add_product():
+    barcode = barcode_var.get().strip()
+    name = name_var.get().strip()
+    cost = safe_float(cost_var.get())
+    price = safe_float(price_var.get())
+    qty = safe_int(qty_var.get())
+    min_qty = safe_int(min_qty_var.get())
+
+    if not name:
+        messagebox.showwarning("تنبيه", "اكتب اسم المنتج.")
+        name_entry.focus_set()
+        return
+    if cost < 0 or price < 0 or qty < 0 or min_qty < 0:
+        messagebox.showwarning("تنبيه", "القيم لا يمكن أن تكون سالبة.")
+        return
+
+    try:
+        cur.execute("""
+            INSERT INTO products
+            (barcode, name, cost, price, quantity, min_quantity, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (barcode or None, name, cost, price, qty, min_qty,
+              datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        conn.commit()
+        refresh_products(search_var.get())
+        product_clear()
+        messagebox.showinfo("نجاح", "تمت إضافة المنتج بنجاح.")
+    except sqlite3.IntegrityError:
+        messagebox.showerror("خطأ", "رقم الباركود مستخدم بالفعل.")
+    except Exception as e:
+        messagebox.showerror("خطأ", str(e))
+
+
+def update_product():
+    pid = selected_product_id()
+    if pid is None:
+        messagebox.showwarning("تنبيه", "اختر منتجًا من الجدول أولًا.")
+        return
+
+    barcode = barcode_var.get().strip()
+    name = name_var.get().strip()
+    cost = safe_float(cost_var.get())
+    price = safe_float(price_var.get())
+    qty = safe_int(qty_var.get())
+    min_qty = safe_int(min_qty_var.get())
+
+    if not name:
+        messagebox.showwarning("تنبيه", "اكتب اسم المنتج.")
+        return
+    if cost < 0 or price < 0 or qty < 0 or min_qty < 0:
+        messagebox.showwarning("تنبيه", "القيم لا يمكن أن تكون سالبة.")
+        return
+
+    try:
+        cur.execute("""
+            UPDATE products
+            SET barcode=?, name=?, cost=?, price=?, quantity=?, min_quantity=?
+            WHERE id=?
+        """, (barcode or None, name, cost, price, qty, min_qty, pid))
+        conn.commit()
+        refresh_products(search_var.get())
+        product_clear()
+        messagebox.showinfo("نجاح", "تم تعديل المنتج بنجاح.")
+    except sqlite3.IntegrityError:
+        messagebox.showerror("خطأ", "رقم الباركود مستخدم لمنتج آخر.")
+    except Exception as e:
+        messagebox.showerror("خطأ", str(e))
+
+
+def delete_product():
+    pid = selected_product_id()
+    if pid is None:
+        messagebox.showwarning("تنبيه", "اختر منتجًا من الجدول أولًا.")
+        return
+
+    if not messagebox.askyesno("تأكيد", "هل تريد حذف المنتج؟"):
+        return
+
+    cur.execute("SELECT COUNT(*) AS c FROM sale_items WHERE product_id=?", (pid,))
+    if cur.fetchone()["c"]:
+        messagebox.showwarning(
+            "تنبيه",
+            "لا يمكن حذف منتج تم استخدامه في فواتير سابقة.\n"
+            "يمكنك تعديل بياناته بدلًا من حذفه."
+        )
+        return
+
+    cur.execute("DELETE FROM products WHERE id=?", (pid,))
+    conn.commit()
+    refresh_products(search_var.get())
+    product_clear()
+    messagebox.showinfo("نجاح", "تم حذف المنتج.")
+
+
+# Product form
+labels = [
+    ("الباركود:", 0, 5), ("اسم المنتج:", 0, 3), ("سعر التكلفة:", 0, 1),
+    ("سعر البيع:", 1, 5), ("الكمية:", 1, 3), ("الحد الأدنى:", 1, 1)
+]
+for text, row, col in labels:
+    tk.Label(product_frame, text=text, bg="#eef2f5",
+             font=("Arial", 10, "bold")).grid(
+                 row=row, column=col, padx=6, pady=5, sticky="e")
+
+barcode_entry = tk.Entry(product_frame, textvariable=barcode_var,
+                         font=("Arial", 11), justify="right", width=22)
+barcode_entry.grid(row=0, column=4, padx=6, pady=5)
+
+name_entry = tk.Entry(product_frame, textvariable=name_var,
+                      font=("Arial", 11), justify="right", width=24)
+name_entry.grid(row=0, column=2, padx=6, pady=5)
+
+cost_entry = tk.Entry(product_frame, textvariable=cost_var,
+                      font=("Arial", 11), justify="right", width=14)
+cost_entry.grid(row=0, column=0, padx=6, pady=5)
+
+price_entry = tk.Entry(product_frame, textvariable=price_var,
+                       font=("Arial", 11), justify="right", width=22)
+price_entry.grid(row=1, column=4, padx=6, pady=5)
+
+qty_entry = tk.Entry(product_frame, textvariable=qty_var,
+                     font=("Arial", 11), justify="right", width=24)
+qty_entry.grid(row=1, column=2, padx=6, pady=5)
+
+min_qty_entry = tk.Entry(product_frame, textvariable=min_qty_var,
+                         font=("Arial", 11), justify="right", width=14)
+min_qty_entry.grid(row=1, column=0, padx=6, pady=5)
+
+tk.Button(product_frame, text="إضافة", bg="#2e8b57", fg="white",
+          font=("Arial", 10, "bold"), width=10,
+          command=add_product).grid(row=1, column=4, padx=6, pady=5)
+
+tk.Button(product_frame, text="تعديل", bg="#e69b2f", fg="white",
+          font=("Arial", 10, "bold"), width=10,
+          command=update_product).grid(row=1, column=3, padx=6, pady=5)
+
+
+# Search
+search_frame = tk.Frame(root, bg="#eef2f5")
+search_frame.pack(fill="x", padx=18, pady=(0, 5))
+
+tk.Label(search_frame, text="البحث:",
+         bg="#eef2f5", font=("Arial", 11, "bold")).pack(side="right", padx=6)
+
+search_entry = tk.Entry(search_frame, textvariable=search_var,
+                        font=("Arial", 11), justify="right", width=35)
+search_entry.pack(side="right", padx=6)
+
+tk.Button(search_frame, text="بحث", bg="#2878c8", fg="white",
+          font=("Arial", 10, "bold"), width=10,
+          command=lambda: refresh_products(search_var.get())).pack(side="right", padx=4)
+
+tk.Button(search_frame, text="عرض الكل", bg="#555f69", fg="white",
+          font=("Arial", 10, "bold"), width=10,
+          command=lambda: (search_var.set(""), refresh_products())).pack(side="right", padx=4)
+
+tk.Button(search_frame, text="حذف", bg="#d9534f", fg="white",
+          font=("Arial", 10, "bold"), width=10,
+          command=delete_product).pack(side="left", padx=4)
+
+tk.Button(search_frame, text="مسح", bg="#666", fg="white",
+          font=("Arial", 10, "bold"), width=10,
+          command=product_clear).pack(side="left", padx=4)
+
+
+# Product table
+table_frame = tk.Frame(root)
+table_frame.pack(fill="both", expand=True, padx=15, pady=5)
+
+product_columns = ("id", "barcode", "name", "cost", "price", "quantity", "min_qty")
+product_tree = ttk.Treeview(table_frame, columns=product_columns,
+                            show="headings", selectmode="browse")
+
+headers = {
+    "id": "الرقم", "barcode": "الباركود", "name": "اسم المنتج",
+    "cost": "التكلفة", "price": "البيع", "quantity": "الكمية",
+    "min_qty": "الحد الأدنى"
+}
+widths = {
+    "id": 60, "barcode": 170, "name": 250,
+    "cost": 110, "price": 110, "quantity": 90, "min_qty": 100
+}
+
+for col in product_columns:
+    product_tree.heading(col, text=headers[col])
+    product_tree.column(col, width=widths[col], anchor="center")
+product_tree.tag_configure("low", background="#fff0f0")
+
+scroll = ttk.Scrollbar(table_frame, orient="vertical",
+                       command=product_tree.yview)
+product_tree.configure(yscrollcommand=scroll.set)
+product_tree.pack(side="left", fill="both", expand=True)
+scroll.pack(side="right", fill="y")
+product_tree.bind("<<TreeviewSelect>>", load_product)
+
+
+# ---------------------------------------------------------
+# POS
+# ---------------------------------------------------------
+def open_pos():
+    pos = tk.Toplevel(root)
+    pos.title("نقطة البيع - نظام إدارة المحل")
+    pos.geometry("1120x720")
+    pos.minsize(950, 620)
+    pos.configure(bg="#f2f4f7")
+    center_window(pos, 1120, 720)
+
+    cart = []
+    scan_var = tk.StringVar()
+    paid_var = tk.StringVar()
+    discount_var = tk.StringVar(value="0")
+    total_var = tk.StringVar(value="0.00")
+    subtotal_var = tk.StringVar(value="0.00")
+    change_var = tk.StringVar(value="0.00")
+
+    top = tk.Frame(pos, bg="#1261a0", height=60)
+    top.pack(fill="x")
+    top.pack_propagate(False)
+    tk.Label(top, text="نقطة البيع POS",
+             bg="#1261a0", fg="white",
+             font=("Arial", 20, "bold")).pack(expand=True)
+
+    input_frame = tk.LabelFrame(
+        pos, text="إضافة المنتجات",
+        bg="#f2f4f7", font=("Arial", 11, "bold"),
+        padx=10, pady=8
+    )
+    input_frame.pack(fill="x", padx=10, pady=10)
+
+    tk.Label(input_frame, text="الباركود / اسم المنتج:",
+             bg="#f2f4f7", font=("Arial", 10, "bold")).pack(side="right", padx=5)
+
+    scan_entry = tk.Entry(input_frame, textvariable=scan_var,
+                          font=("Arial", 14), justify="right", width=35)
+    scan_entry.pack(side="right", padx=5)
+
+    def find_product(value):
+        value = value.strip()
+        if not value:
+            return None
+        cur.execute("""
+            SELECT * FROM products
+            WHERE barcode=? OR name=?
+            LIMIT 1
+        """, (value, value))
+        row = cur.fetchone()
+        if row is None:
+            cur.execute("""
+                SELECT * FROM products
+                WHERE barcode LIKE ? OR name LIKE ?
+                ORDER BY name LIMIT 1
+            """, (f"%{value}%", f"%{value}%"))
+            row = cur.fetchone()
+        return row
+
+    def recalc():
+        subtotal = sum(x["total"] for x in cart)
+        discount = max(0.0, safe_float(discount_var.get()))
+        if discount > subtotal:
+            discount = subtotal
+            discount_var.set(money(discount))
+        total = max(0.0, subtotal - discount)
+        paid = safe_float(paid_var.get())
+        change = max(0.0, paid - total)
+        subtotal_var.set(money(subtotal))
+        total_var.set(money(total))
+        change_var.set(money(change))
+
+    def refresh_cart():
+        clear_tree(cart_tree)
+        for i, item in enumerate(cart):
+            cart_tree.insert("", "end", values=(
+                i + 1, item["barcode"], item["name"],
+                item["quantity"], money(item["price"]), money(item["total"])
+            ))
+        recalc()
+
+    def add_to_cart():
+        value = scan_var.get().strip()
+        if not value:
+            return
+
+        product = find_product(value)
+        if product is None:
+            messagebox.showerror("غير موجود", "لم يتم العثور على المنتج.",
+                                 parent=pos)
+            scan_entry.selection_range(0, "end")
+            return
+
+        if product["quantity"] <= 0:
+            messagebox.showwarning("المخزون", "هذا المنتج غير متوفر في المخزون.",
+                                   parent=pos)
+            return
+
+        existing = next((x for x in cart if x["id"] == product["id"]), None)
+        current_qty = existing["quantity"] if existing else 0
+
+        if current_qty + 1 > product["quantity"]:
+            messagebox.showwarning(
+                "المخزون",
+                f"الكمية المتاحة من المنتج: {product['quantity']}",
+                parent=pos
+            )
+            return
+
+        if existing:
+            existing["quantity"] += 1
+            existing["total"] = existing["quantity"] * existing["price"]
+        else:
+            cart.append({
+                "id": product["id"],
+                "barcode": product["barcode"] or "",
+                "name": product["name"],
+                "quantity": 1,
+                "price": float(product["price"]),
+                "cost": float(product["cost"]),
+                "total": float(product["price"])
+            })
+
+        scan_var.set("")
+        refresh_cart()
+        scan_entry.focus_set()
+
+    def remove_cart_item():
+        selected = cart_tree.selection()
+        if not selected:
+            return
+        idx = cart_tree.index(selected[0])
+        if 0 <= idx < len(cart):
+            cart.pop(idx)
+            refresh_cart()
+
+    def clear_cart():
+        if cart and not messagebox.askyesno(
+            "تأكيد", "هل تريد مسح الفاتورة الحالية؟", parent=pos
+        ):
+            return
+        cart.clear()
+        paid_var.set("")
+        discount_var.set("0")
+        refresh_cart()
+        scan_entry.focus_set()
+
+    def change_quantity():
+        selected = cart_tree.selection()
+        if not selected:
+            messagebox.showwarning("تنبيه", "اختر صنفًا من الفاتورة.", parent=pos)
+            return
+
+        idx = cart_tree.index(selected[0])
+        item = cart[idx]
+
+        win = tk.Toplevel(pos)
+        win.title("تعديل الكمية")
+        win.geometry("300x160")
+        win.transient(pos)
+        win.grab_set()
+        center_window(win, 300, 160)
+
+        tk.Label(win, text="الكمية الجديدة:",
+                 font=("Arial", 11, "bold")).pack(pady=10)
+        qv = tk.StringVar(value=str(item["quantity"]))
+        qe = tk.Entry(win, textvariable=qv,
+                      font=("Arial", 13), justify="center")
+        qe.pack()
+        qe.focus_set()
+
+        def save():
+            q = safe_int(qv.get())
+            cur.execute("SELECT quantity FROM products WHERE id=?", (item["id"],))
+            row = cur.fetchone()
+            available = row["quantity"] if row else 0
+            if q <= 0:
+                messagebox.showwarning("تنبيه", "الكمية يجب أن تكون أكبر من صفر.",
+                                       parent=win)
+                return
+            if q > available:
+                messagebox.showwarning("المخزون", f"المتاح: {available}",
+                                       parent=win)
+                return
+            item["quantity"] = q
+            item["total"] = q * item["price"]
+            refresh_cart()
+            win.destroy()
+
+        tk.Button(win, text="حفظ", command=save,
+                  bg="#2e8b57", fg="white",
+                  font=("Arial", 10, "bold"),
+                  width=12).pack(pady=10)
+
+        qe.bind("<Return>", lambda e: save())
+
+    def product_search_window():
+        win = tk.Toplevel(pos)
+        win.title("بحث عن منتج")
+        win.geometry("750x500")
+        center_window(win, 750, 500)
+        win.transient(pos)
+
+        sv = tk.StringVar()
+        topf = tk.Frame(win)
+        topf.pack(fill="x", padx=10, pady=10)
+        ent = tk.Entry(topf, textvariable=sv,
+                       font=("Arial", 13), justify="right")
+        ent.pack(side="right", fill="x", expand=True, padx=5)
+
+        cols = ("id", "barcode", "name", "price", "quantity")
+        tr = ttk.Treeview(win, columns=cols, show="headings")
+        hs = {"id": "الرقم", "barcode": "الباركود", "name": "المنتج",
+              "price": "السعر", "quantity": "المخزون"}
+        for c in cols:
+            tr.heading(c, text=hs[c])
+            tr.column(c, anchor="center")
+        tr.pack(fill="both", expand=True, padx=10, pady=5)
+
+        def load():
+            clear_tree(tr)
+            text = sv.get().strip()
+            cur.execute("""
+                SELECT id, barcode, name, price, quantity
+                FROM products
+                WHERE barcode LIKE ? OR name LIKE ?
+                ORDER BY name
+            """, (f"%{text}%", f"%{text}%"))
+            for row in cur.fetchall():
+                tr.insert("", "end", values=(
+                    row["id"], row["barcode"] or "", row["name"],
+                    money(row["price"]), row["quantity"]
+                ))
+
+        def choose():
+            sel = tr.selection()
+            if not sel:
+                return
+            values = tr.item(sel[0], "values")
+            scan_var.set(values[1] or values[2])
+            win.destroy()
+            add_to_cart()
+
+        tk.Button(topf, text="بحث", command=load,
+                  bg="#2878c8", fg="white",
+                  font=("Arial", 10, "bold")).pack(side="right")
+        tk.Button(win, text="إضافة المحدد", command=choose,
+                  bg="#2e8b57", fg="white",
+                  font=("Arial", 10, "bold")).pack(pady=8)
+
+        ent.bind("<KeyRelease>", lambda e: load())
+        tr.bind("<Double-1>", lambda e: choose())
+        load()
+        ent.focus_set()
+
+    def complete_sale():
+        if not cart:
+            messagebox.showwarning("تنبيه", "الفاتورة فارغة.", parent=pos)
+            return
+
+        subtotal = sum(x["total"] for x in cart)
+        discount = max(0.0, safe_float(discount_var.get()))
+        discount = min(discount, subtotal)
+        total = subtotal - discount
+        paid = safe_float(paid_var.get())
+
+        if paid < total:
+            messagebox.showwarning(
+                "المبلغ المدفوع",
+                "المبلغ المدفوع أقل من إجمالي الفاتورة.",
+                parent=pos
+            )
+            paid_entry.focus_set()
+            return
+
+        # Re-check stock immediately before transaction.
+        for item in cart:
+            cur.execute("""
+                SELECT quantity, cost, price, name, barcode
+                FROM products WHERE id=?
+            """, (item["id"],))
+            row = cur.fetchone()
+            if row is None:
+                messagebox.showerror("خطأ",
+                                     f"المنتج غير موجود: {item['name']}",
+                                     parent=pos)
+                return
+            if item["quantity"] > row["quantity"]:
+                messagebox.showerror(
+                    "المخزون",
+                    f"المخزون غير كافٍ للمنتج: {item['name']}\n"
+                    f"المتاح: {row['quantity']}",
+                    parent=pos
+                )
+                return
+
+        invoice_no = generate_invoice_no()
+        sale_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        change = paid - total
+        profit_before_discount = sum(
+            (item["price"] - item["cost"]) * item["quantity"]
+            for item in cart
+        )
+        profit = profit_before_discount - discount
+
+        try:
+            conn.execute("BEGIN")
+
+            cur.execute("""
+                INSERT INTO sales
+                (invoice_no, sale_date, subtotal, discount, total,
+                 paid, change_amount, profit)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (invoice_no, sale_date, subtotal, discount, total,
+                  paid, change, profit))
+
+            sale_id = cur.lastrowid
+
+            for item in cart:
+                cur.execute("""
+                    INSERT INTO sale_items
+                    (sale_id, product_id, barcode, name,
+                     quantity, price, cost, total)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    sale_id, item["id"], item["barcode"], item["name"],
+                    item["quantity"], item["price"], item["cost"], item["total"]
+                ))
+                cur.execute("""
+                    UPDATE products
+                    SET quantity = quantity - ?
+                    WHERE id=? AND quantity >= ?
+                """, (item["quantity"], item["id"], item["quantity"]))
+                if cur.rowcount != 1:
+                    raise RuntimeError("تعذر تحديث مخزون أحد المنتجات.")
+
+            conn.commit()
+
+            saved_items = [dict(x) for x in cart]
+            cart.clear()
+            paid_var.set("")
+            discount_var.set("0")
+            refresh_cart()
+            refresh_products(search_var.get())
+
+            messagebox.showinfo(
+                "تمت عملية البيع",
+                f"تم حفظ الفاتورة بنجاح.\n"
+                f"رقم الفاتورة: {invoice_no}\n"
+                f"الإجمالي: {money(total)}\n"
+                f"الباقي: {money(change)}",
+                parent=pos
+            )
+
+            show_receipt_preview(
+                pos, invoice_no, sale_date, saved_items,
+                subtotal, discount, total, paid, change, profit
+            )
+            scan_entry.focus_set()
+
+        except Exception as e:
+            conn.rollback()
+            messagebox.showerror("خطأ", str(e), parent=pos)
+
+    # Buttons/input
+    tk.Button(input_frame, text="إضافة",
+              command=add_to_cart,
+              bg="#2e8b57", fg="white",
+              font=("Arial", 10, "bold"), width=12).pack(side="right", padx=5)
+
+    tk.Button(input_frame, text="بحث عن منتج",
+              command=product_search_window,
+              bg="#2878c8", fg="white",
+              font=("Arial", 10, "bold"), width=13).pack(side="right", padx=5)
+
+    tk.Label(input_frame,
+             text="قارئ USB: امسح الباركود ثم Enter",
+             bg="#f2f4f7", fg="#555",
+             font=("Arial", 9)).pack(side="left", padx=10)
+
+    cart_frame = tk.Frame(pos)
+    cart_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+    cart_columns = ("num", "barcode", "name", "qty", "price", "total")
+    cart_tree = ttk.Treeview(cart_frame, columns=cart_columns,
+                             show="headings", selectmode="browse")
+
+    cart_headers = {
+        "num": "م", "barcode": "الباركود", "name": "اسم المنتج",
+        "qty": "الكمية", "price": "سعر البيع", "total": "الإجمالي"
+    }
+    cart_widths = {
+        "num": 50, "barcode": 170, "name": 320,
+        "qty": 90, "price": 120, "total": 130
+    }
+    for col in cart_columns:
+        cart_tree.heading(col, text=cart_headers[col])
+        cart_tree.column(col, width=cart_widths[col], anchor="center")
+
+    cart_scroll = ttk.Scrollbar(cart_frame, orient="vertical",
+                                command=cart_tree.yview)
+    cart_tree.configure(yscrollcommand=cart_scroll.set)
+    cart_tree.pack(side="left", fill="both", expand=True)
+    cart_scroll.pack(side="right", fill="y")
+
+    action_frame = tk.Frame(pos, bg="#f2f4f7")
+    action_frame.pack(fill="x", padx=10, pady=8)
+
+    tk.Button(action_frame, text="تعديل الكمية",
+              command=change_quantity, bg="#e69b2f", fg="white",
+              font=("Arial", 10, "bold"), width=13).pack(side="right", padx=4)
+    tk.Button(action_frame, text="حذف الصنف",
+              command=remove_cart_item, bg="#d9534f", fg="white",
+              font=("Arial", 10, "bold"), width=13).pack(side="right", padx=4)
+    tk.Button(action_frame, text="مسح الفاتورة",
+              command=clear_cart, bg="#666", fg="white",
+              font=("Arial", 10, "bold"), width=13).pack(side="right", padx=4)
+
+    totals = tk.Frame(pos, bg="white", bd=1, relief="solid")
+    totals.pack(fill="x", padx=10, pady=5)
+
+    tk.Label(totals, text="قبل الخصم:", bg="white",
+             font=("Arial", 12, "bold")).grid(row=0, column=7, padx=7, pady=8)
+    tk.Label(totals, textvariable=subtotal_var, bg="white",
+             fg="#1261a0", font=("Arial", 14, "bold")).grid(row=0, column=6)
+
+    tk.Label(totals, text="الخصم:", bg="white",
+             font=("Arial", 12, "bold")).grid(row=0, column=5, padx=7)
+    discount_entry = tk.Entry(totals, textvariable=discount_var,
+                              font=("Arial", 13, "bold"),
+                              justify="center", width=10)
+    discount_entry.grid(row=0, column=4, padx=7)
+
+    tk.Label(totals, text="الإجمالي:", bg="white",
+             font=("Arial", 12, "bold")).grid(row=0, column=3, padx=7)
+    tk.Label(totals, textvariable=total_var, bg="white",
+             fg="#1261a0", font=("Arial", 16, "bold")).grid(row=0, column=2)
+
+    tk.Label(totals, text="المدفوع:", bg="white",
+             font=("Arial", 12, "bold")).grid(row=0, column=1, padx=7)
+    paid_entry = tk.Entry(totals, textvariable=paid_var,
+                          font=("Arial", 14, "bold"),
+                          justify="center", width=12)
+    paid_entry.grid(row=0, column=0, padx=7)
+
+    change_frame = tk.Frame(pos, bg="#eaf7ee", bd=1, relief="solid")
+    change_frame.pack(fill="x", padx=10, pady=4)
+    tk.Label(change_frame, text="الباقي:", bg="#eaf7ee",
+             font=("Arial", 13, "bold")).pack(side="right", padx=10)
+    tk.Label(change_frame, textvariable=change_var, bg="#eaf7ee",
+             fg="#2e8b57", font=("Arial", 17, "bold")).pack(side="right")
+
+    bottom = tk.Frame(pos, bg="#f2f4f7")
+    bottom.pack(fill="x", padx=10, pady=8)
+
+    tk.Button(bottom, text="إتمام البيع",
+              command=complete_sale, bg="#1261a0", fg="white",
+              font=("Arial", 13, "bold"), width=18).pack(side="right", padx=8)
+    tk.Button(bottom, text="إغلاق", command=pos.destroy,
+              bg="#555", fg="white",
+              font=("Arial", 11, "bold"), width=12).pack(side="left", padx=8)
+
+    scan_entry.bind("<Return>", lambda e: add_to_cart())
+    paid_entry.bind("<KeyRelease>", lambda e: recalc())
+    discount_entry.bind("<KeyRelease>", lambda e: recalc())
+    scan_entry.focus_set()
+
+
+# ---------------------------------------------------------
+# RECEIPT PREVIEW
+# ---------------------------------------------------------
+def show_receipt_preview(parent, invoice_no, sale_date, items, subtotal,
+                         discount, total, paid, change, profit):
+    text = receipt_text(
+        invoice_no, sale_date, items,
+        subtotal, discount, total, paid, change, profit
+    )
+
+    preview = tk.Toplevel(parent)
+    preview.title("معاينة الفاتورة")
+    preview.geometry("500x650")
+    center_window(preview, 500, 650)
+
+    txt = tk.Text(preview, font=("Courier New", 11),
+                  wrap="none", padx=15, pady=15)
+    txt.pack(fill="both", expand=True)
+    txt.insert("1.0", text)
+    txt.configure(state="disabled")
+
+    def save_receipt():
+        filename = filedialog.asksaveasfilename(
+            parent=preview,
+            title="حفظ الفاتورة",
+            initialfile=f"فاتورة_{invoice_no}.txt",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt")]
+        )
+        if not filename:
+            return
+        try:
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write(text)
+            messagebox.showinfo("تم الحفظ", "تم حفظ الفاتورة بنجاح.",
+                                parent=preview)
+        except Exception as e:
+            messagebox.showerror("خطأ", str(e), parent=preview)
+
+    def do_print():
+        ok, msg = print_text_receipt(text, preview)
+        if ok:
+            messagebox.showinfo("الطباعة", msg, parent=preview)
+        else:
+            messagebox.showwarning("الطباعة", msg, parent=preview)
+
+    btns = tk.Frame(preview)
+    btns.pack(fill="x", pady=8)
+    tk.Button(btns, text="حفظ", command=save_receipt,
+              bg="#2878c8", fg="white",
+              font=("Arial", 10, "bold")).pack(side="right", padx=8)
+    tk.Button(btns, text="طباعة 80mm", command=do_print,
+              bg="#2e8b57", fg="white",
+              font=("Arial", 10, "bold")).pack(side="right", padx=8)
+    tk.Button(btns, text="إغلاق", command=preview.destroy,
+              bg="#666", fg="white",
+              font=("Arial", 10, "bold")).pack(side="left", padx=8)
+
+
+# ---------------------------------------------------------
+# INVENTORY REPORT
+# ---------------------------------------------------------
+def open_inventory():
+    win = tk.Toplevel(root)
+    win.title("المخزون والمنتجات الناقصة")
+    win.geometry("950x620")
+    center_window(win, 950, 620)
+    win.configure(bg="#f2f4f7")
+
+    tk.Label(win, text="المخزون",
+             bg="#1261a0", fg="white",
+             font=("Arial", 20, "bold")).pack(fill="x", ipady=15)
+
+    search = tk.StringVar()
+    topf = tk.Frame(win, bg="#f2f4f7")
+    topf.pack(fill="x", padx=12, pady=10)
+
+    tk.Label(topf, text="بحث:", bg="#f2f4f7",
+             font=("Arial", 10, "bold")).pack(side="right")
+    ent = tk.Entry(topf, textvariable=search,
+                   font=("Arial", 11), justify="right", width=35)
+    ent.pack(side="right", padx=6)
+
+    only_low = tk.BooleanVar(value=False)
+    tk.Checkbutton(topf, text="المنتجات الناقصة فقط",
+                   variable=only_low, bg="#f2f4f7",
+                   font=("Arial", 10, "bold")).pack(side="right", padx=10)
+
+    cols = ("id", "barcode", "name", "cost", "price", "qty", "min", "value")
+    tr = ttk.Treeview(win, columns=cols, show="headings")
+    hs = {
+        "id": "الرقم", "barcode": "الباركود", "name": "المنتج",
+        "cost": "التكلفة", "price": "البيع", "qty": "المخزون",
+        "min": "الحد الأدنى", "value": "قيمة المخزون"
+    }
+    for c in cols:
+        tr.heading(c, text=hs[c])
+        tr.column(c, anchor="center")
+    tr.pack(fill="both", expand=True, padx=12, pady=5)
+
+    def load():
+        clear_tree(tr)
+        text = search.get().strip()
+        query = """
+            SELECT id, barcode, name, cost, price, quantity, min_quantity
+            FROM products
+            WHERE (barcode LIKE ? OR name LIKE ?)
+        """
+        params = [f"%{text}%", f"%{text}%"]
+        if only_low.get():
+            query += " AND quantity <= min_quantity "
+        query += " ORDER BY quantity ASC, name ASC"
+        cur.execute(query, params)
+        for row in cur.fetchall():
+            tr.insert("", "end", values=(
+                row["id"], row["barcode"] or "", row["name"],
+                money(row["cost"]), money(row["price"]),
+                row["quantity"], row["min_quantity"],
+                money(row["cost"] * row["quantity"])
+            ))
+
+    tk.Button(topf, text="تحديث", command=load,
+              bg="#2878c8", fg="white",
+              font=("Arial", 10, "bold")).pack(side="right", padx=5)
+    ent.bind("<KeyRelease>", lambda e: load())
+    only_low.trace_add("write", lambda *args: load())
+    load()
+
+
+# ---------------------------------------------------------
+# REPORTS
+# ---------------------------------------------------------
+def open_reports():
+    win = tk.Toplevel(root)
+    win.title("التقارير والأرباح")
+    win.geometry("1100x700")
+    win.minsize(900, 600)
+    center_window(win, 1100, 700)
+    win.configure(bg="#f2f4f7")
+
+    tk.Label(win, text="التقارير والأرباح",
+             bg="#1261a0", fg="white",
+             font=("Arial", 20, "bold")).pack(fill="x", ipady=15)
+
+    stats = tk.Frame(win, bg="#f2f4f7")
+    stats.pack(fill="x", padx=15, pady=12)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    month = datetime.now().strftime("%Y-%m")
+
+    def get_stats(pattern):
+        cur.execute("""
+            SELECT COALESCE(SUM(total),0),
+                   COALESCE(SUM(profit),0),
+                   COUNT(*),
+                   COALESCE(SUM(discount),0)
+            FROM sales WHERE sale_date LIKE ?
+        """, (pattern,))
+        return cur.fetchone()
+
+    d = get_stats(f"{today}%")
+    m = get_stats(f"{month}%")
+
+    cards = [
+        ("مبيعات اليوم", money(d[0])),
+        ("أرباح اليوم", money(d[1])),
+        ("فواتير اليوم", str(d[2])),
+        ("خصومات اليوم", money(d[3])),
+        ("مبيعات الشهر", money(m[0])),
+        ("أرباح الشهر", money(m[1])),
+    ]
+
+    for i, (title, value) in enumerate(cards):
+        card = tk.Frame(stats, bg="white", bd=1, relief="solid")
+        card.grid(row=0, column=i, padx=5, sticky="nsew")
+        tk.Label(card, text=title, bg="white",
+                 font=("Arial", 10, "bold")).pack(pady=(10, 4))
+        tk.Label(card, text=value, bg="white", fg="#1261a0",
+                 font=("Arial", 14, "bold")).pack(pady=(0, 10))
+        stats.grid_columnconfigure(i, weight=1)
+
+    filter_frame = tk.Frame(win, bg="#f2f4f7")
+    filter_frame.pack(fill="x", padx=15, pady=5)
+
+    cols = ("id", "invoice", "date", "subtotal", "discount",
+            "total", "paid", "change", "profit")
+    tree = ttk.Treeview(filter_frame, columns=cols,
+                        show="headings", height=15)
+
+    hs = {
+        "id": "الرقم", "invoice": "رقم الفاتورة", "date": "التاريخ",
+        "subtotal": "قبل الخصم", "discount": "الخصم", "total": "الإجمالي",
+        "paid": "المدفوع", "change": "الباقي", "profit": "الربح"
+    }
+    for c in cols:
+        tree.heading(c, text=hs[c])
+        tree.column(c, width=105, anchor="center")
+    tree.pack(side="left", fill="both", expand=True)
+
+    scr = ttk.Scrollbar(filter_frame, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=scr.set)
+    scr.pack(side="right", fill="y")
+
+    def load_sales(period="today"):
+        clear_tree(tree)
+        if period == "today":
+            pattern = f"{today}%"
+        elif period == "month":
+            pattern = f"{month}%"
+        else:
+            pattern = "%"
+        cur.execute("""
+            SELECT id, invoice_no, sale_date, subtotal, discount,
+                   total, paid, change_amount, profit
+            FROM sales
+            WHERE sale_date LIKE ?
+            ORDER BY id DESC
+        """, (pattern,))
+        for row in cur.fetchall():
+            tree.insert("", "end", values=(
+                row["id"], row["invoice_no"], row["sale_date"],
+                money(row["subtotal"]), money(row["discount"]),
+                money(row["total"]), money(row["paid"]),
+                money(row["change_amount"]), money(row["profit"])
+            ))
+
+    buttons = tk.Frame(win, bg="#f2f4f7")
+    buttons.pack(fill="x", padx=15, pady=10)
+
+    tk.Button(buttons, text="مبيعات اليوم",
+              command=lambda: load_sales("today"),
+              bg="#2878c8", fg="white",
+              font=("Arial", 10, "bold")).pack(side="right", padx=5)
+    tk.Button(buttons, text="مبيعات الشهر",
+              command=lambda: load_sales("month"),
+              bg="#7b61a8", fg="white",
+              font=("Arial", 10, "bold")).pack(side="right", padx=5)
+    tk.Button(buttons, text="كل الفواتير",
+              command=lambda: load_sales("all"),
+              bg="#555f69", fg="white",
+              font=("Arial", 10, "bold")).pack(side="right", padx=5)
+
+    def show_invoice():
+        selected = tree.selection()
+        if not selected:
+            messagebox.showwarning("تنبيه", "اختر فاتورة أولًا.", parent=win)
+            return
+
+        sale_id = tree.item(selected[0], "values")[0]
+        cur.execute("SELECT * FROM sales WHERE id=?", (sale_id,))
+        sale = cur.fetchone()
+        cur.execute("""
+            SELECT * FROM sale_items
+            WHERE sale_id=? ORDER BY id
+        """, (sale_id,))
+        items = cur.fetchall()
+
+        text = receipt_text(
+            sale["invoice_no"], sale["sale_date"],
+            [dict(x) for x in items],
+            sale["subtotal"], sale["discount"], sale["total"],
+            sale["paid"], sale["change_amount"], sale["profit"]
+        )
+
+        detail = tk.Toplevel(win)
+        detail.title("تفاصيل الفاتورة")
+        detail.geometry("500x600")
+        center_window(detail, 500, 600)
+        t = tk.Text(detail, font=("Courier New", 11),
+                    padx=15, pady=15)
+        t.pack(fill="both", expand=True)
+        t.insert("1.0", text)
+        t.configure(state="disabled")
+
+        tk.Button(detail, text="إغلاق",
+                  command=detail.destroy,
+                  bg="#666", fg="white",
+                  font=("Arial", 10, "bold")).pack(pady=8)
+
+    def delete_invoice():
+        selected = tree.selection()
+        if not selected:
+            messagebox.showwarning("تنبيه", "اختر فاتورة أولًا.", parent=win)
+            return
+        sale_id = tree.item(selected[0], "values")[0]
+        if not messagebox.askyesno(
+            "تأكيد",
+            "حذف الفاتورة سيعيد الكميات إلى المخزون.\nهل تريد المتابعة؟",
+            parent=win
+        ):
+            return
+        try:
+            conn.execute("BEGIN")
+            cur.execute("SELECT * FROM sale_items WHERE sale_id=?", (sale_id,))
+            items = cur.fetchall()
+            for item in items:
+                cur.execute("""
+                    UPDATE products SET quantity=quantity+?
+                    WHERE id=?
+                """, (item["quantity"], item["product_id"]))
+            cur.execute("DELETE FROM sale_items WHERE sale_id=?", (sale_id,))
+            cur.execute("DELETE FROM sales WHERE id=?", (sale_id,))
+            conn.commit()
+            load_sales("today")
+            refresh_products(search_var.get())
+            messagebox.showinfo("نجاح", "تم حذف الفاتورة وإرجاع الكميات.",
+                                parent=win)
+        except Exception as e:
+            conn.rollback()
+            messagebox.showerror("خطأ", str(e), parent=win)
+
+    tk.Button(buttons, text="عرض الفاتورة",
+              command=show_invoice, bg="#2e8b57", fg="white",
+              font=("Arial", 10, "bold")).pack(side="left", padx=5)
+    tk.Button(buttons, text="حذف الفاتورة",
+              command=delete_invoice, bg="#d9534f", fg="white",
+              font=("Arial", 10, "bold")).pack(side="left", padx=5)
+
+    load_sales("today")
+
+
+# ---------------------------------------------------------
+# SETTINGS
+# ---------------------------------------------------------
+def open_settings():
+    win = tk.Toplevel(root)
+    win.title("إعدادات المحل")
+    win.geometry("500x400")
+    center_window(win, 500, 400)
+    win.configure(bg="#f2f4f7")
+
+    tk.Label(win, text="إعدادات المحل",
+             bg="#1261a0", fg="white",
+             font=("Arial", 18, "bold")).pack(fill="x", ipady=12)
+
+    form = tk.Frame(win, bg="#f2f4f7")
+    form.pack(fill="both", expand=True, padx=25, pady=20)
+
+    shop_v = tk.StringVar(value=get_setting("shop_name", "نظام إدارة المحل"))
+    owner_v = tk.StringVar(value=get_setting("owner_name", "وائل شاكر"))
+    phone_v = tk.StringVar(value=get_setting("shop_phone", ""))
+    printer_v = tk.StringVar(value=get_setting("printer_name", ""))
+
+    fields = [
+        ("اسم المحل:", shop_v),
+        ("اسم المالك:", owner_v),
+        ("رقم الهاتف:", phone_v),
+        ("اسم الطابعة Windows:", printer_v),
+    ]
+
+    for i, (label, var) in enumerate(fields):
+        tk.Label(form, text=label, bg="#f2f4f7",
+                 font=("Arial", 10, "bold")).grid(
+                     row=i, column=1, padx=5, pady=10, sticky="e")
+        tk.Entry(form, textvariable=var,
+                 font=("Arial", 11), justify="right",
+                 width=30).grid(row=i, column=0, padx=5, pady=10)
+
+    tk.Label(form,
+             text="اترك اسم الطابعة فارغًا لاستخدام طباعة Windows العادية.\n"
+                  "للطباعة الخام ESC/POS على Windows يمكن تثبيت pywin32.",
+             bg="#f2f4f7", fg="#555",
+             font=("Arial", 9), justify="right").grid(
+                 row=4, column=0, columnspan=2, pady=15)
+
+    def save():
+        set_setting("shop_name", shop_v.get().strip() or "نظام إدارة المحل")
+        set_setting("owner_name", owner_v.get().strip() or "وائل شاكر")
+        set_setting("shop_phone", phone_v.get().strip())
+        set_setting("printer_name", printer_v.get().strip())
+        messagebox.showinfo("نجاح", "تم حفظ الإعدادات.", parent=win)
+        win.destroy()
+
+    tk.Button(win, text="حفظ الإعدادات",
+              command=save, bg="#2e8b57", fg="white",
+              font=("Arial", 11, "bold"), width=18).pack(pady=10)
+
+
+# ---------------------------------------------------------
+# BACKUP / RESTORE
+# ---------------------------------------------------------
+def backup_database():
+    conn.commit()
+    filename = filedialog.asksaveasfilename(
+        parent=root,
+        title="حفظ نسخة احتياطية",
+        initialfile=f"store_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db",
+        defaultextension=".db",
+        filetypes=[("SQLite Database", "*.db")]
+    )
+    if not filename:
+        return
+    try:
+        shutil.copy2(DB_FILE, filename)
+        messagebox.showinfo("نجاح", "تم إنشاء النسخة الاحتياطية بنجاح.")
+    except Exception as e:
+        messagebox.showerror("خطأ", str(e))
+
+
+def restore_database():
+    filename = filedialog.askopenfilename(
+        parent=root,
+        title="اختيار نسخة احتياطية",
+        filetypes=[("SQLite Database", "*.db"), ("All files", "*.*")]
+    )
+    if not filename:
+        return
+
+    if not messagebox.askyesno(
+        "تأكيد",
+        "استعادة النسخة ستستبدل قاعدة البيانات الحالية.\n"
+        "يفضل إنشاء نسخة احتياطية أولًا.\n\nهل تريد المتابعة؟"
+    ):
+        return
+
+    try:
+        conn.commit()
+        conn.close()
+        shutil.copy2(filename, DB_FILE)
+        messagebox.showinfo(
+            "تمت الاستعادة",
+            "تمت استعادة قاعدة البيانات.\n"
+            "سيتم إغلاق البرنامج، ثم يمكنك تشغيله مرة أخرى."
+        )
+        root.destroy()
+    except Exception as e:
+        messagebox.showerror("خطأ", str(e))
+        # Try to reconnect if possible.
+        try:
+            globals()["conn"] = sqlite3.connect(DB_FILE)
+            conn.row_factory = sqlite3.Row
+            globals()["cur"] = conn.cursor()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------
+# MAIN BUTTONS
+# ---------------------------------------------------------
+bottom_main = tk.Frame(root, bg="#eef2f5")
+bottom_main.pack(fill="x", padx=15, pady=12)
+
+buttons = [
+    ("نقطة البيع", open_pos, "#18a6b8"),
+    ("التقارير والأرباح", open_reports, "#7655a8"),
+    ("المخزون", open_inventory, "#2e8b57"),
+    ("الإعدادات", open_settings, "#e69b2f"),
+    ("نسخة احتياطية", backup_database, "#2878c8"),
+    ("استعادة", restore_database, "#d9534f"),
+]
+
+for text, command, bg in buttons:
+    tk.Button(bottom_main, text=text, command=command,
+              bg=bg, fg="white",
+              font=("Arial", 11, "bold"),
+              width=16, height=2).pack(side="right", padx=5)
+
+
+# ---------------------------------------------------------
+# KEYBOARD SHORTCUTS
+# ---------------------------------------------------------
+def focus_search(event=None):
+    search_entry.focus_set()
+    search_entry.selection_range(0, "end")
+
+
+root.bind("<F2>", lambda e: open_pos())
+root.bind("<F3>", focus_search)
+root.bind("<F4>", lambda e: open_inventory())
+root.bind("<F5>", lambda e: open_reports())
+
+
+# ---------------------------------------------------------
+# START
+# ---------------------------------------------------------
+refresh_products()
+barcode_entry.focus_set()
+
+
+def on_close():
+    try:
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+    root.destroy()
+
+
+root.protocol("WM_DELETE_WINDOW", on_close)
+root.mainloop()
