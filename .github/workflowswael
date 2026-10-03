@@ -1,0 +1,1630 @@
+# -*- coding: utf-8 -*-
+"""
+حاسب الفاتورة الذكي
+نسخة Android مبنية بواسطة Kivy + Buildozer
+"""
+
+__version__ = "1.0.0"
+
+import os
+
+from kivy.app import App
+from kivy.core.window import Window
+from kivy.core.text import LabelBase
+from kivy.uix.screenmanager import ScreenManager, Screen
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.button import Button
+from kivy.uix.label import Label
+from kivy.uix.image import Image
+from kivy.uix.textinput import TextInput
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.popup import Popup
+from kivy.metrics import dp
+from kivy.utils import platform
+from kivy.clock import Clock
+
+Window.clearcolor = (0.025, 0.025, 0.025, 1)
+
+APP_NAME = "حاسب الفاتورة الذكي"
+
+
+# ============================================================
+# العربية والخط
+# ============================================================
+
+try:
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+    ARABIC_SUPPORT = True
+except Exception:
+    ARABIC_SUPPORT = False
+
+
+def ar(text):
+    if text is None:
+        return ""
+    text = str(text)
+
+    if not ARABIC_SUPPORT:
+        return text
+
+    try:
+        return get_display(arabic_reshaper.reshape(text))
+    except Exception:
+        return text
+
+
+FONT_PATHS = [
+    os.path.join("fonts", "NotoNaskhArabic-Regular.ttf"),
+    os.path.join("fonts", "NotoSansArabic-Regular.ttf"),
+    "/system/fonts/NotoNaskhArabic-Regular.ttf",
+    "/system/fonts/NotoSansArabic-Regular.ttf",
+    "/system/fonts/DroidSansArabic.ttf",
+]
+
+ARABIC_FONT = "Roboto"
+
+for path in FONT_PATHS:
+    try:
+        if os.path.exists(path):
+            LabelBase.register(name="ArabicFont", fn_regular=path)
+            ARABIC_FONT = "ArabicFont"
+            break
+    except Exception:
+        pass
+
+
+# ============================================================
+# الأرقام
+# ============================================================
+
+def normalize_number(value):
+    if value is None:
+        return ""
+
+    value = str(value)
+
+    arabic = "٠١٢٣٤٥٦٧٨٩"
+    english = "0123456789"
+
+    for a, e in zip(arabic, english):
+        value = value.replace(a, e)
+
+    persian = "۰۱۲۳۴۵۶۷۸۹"
+
+    for a, e in zip(persian, english):
+        value = value.replace(a, e)
+
+    value = value.replace("،", ".")
+    value = value.replace(",", ".")
+
+    return value
+
+
+def number_value(value):
+    try:
+        return float(normalize_number(value))
+    except Exception:
+        return 0.0
+
+
+# ============================================================
+# زر ذهبي
+# ============================================================
+
+class GoldButton(Button):
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        self.font_name = ARABIC_FONT
+        self.font_size = dp(16)
+        self.bold = True
+
+        self.color = (0.04, 0.04, 0.04, 1)
+
+        self.background_normal = ""
+        self.background_down = ""
+
+        self.background_color = (
+            0.88,
+            0.64,
+            0.08,
+            1
+        )
+
+
+# ============================================================
+# الشاشة الرئيسية
+# ============================================================
+
+class HomeScreen(Screen):
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        self.image_path = ""
+        self.waiting_for_camera = False
+        self.waiting_for_gallery = False
+
+        root = BoxLayout(
+            orientation="vertical",
+            padding=[
+                dp(18),
+                dp(15),
+                dp(18),
+                dp(15)
+            ],
+            spacing=dp(10)
+        )
+
+        title = Label(
+            text=ar(APP_NAME),
+            font_name=ARABIC_FONT,
+            font_size=dp(27),
+            bold=True,
+            color=(0.95, 0.72, 0.15, 1),
+            size_hint_y=None,
+            height=dp(55),
+            halign="center",
+            valign="middle"
+        )
+
+        title.bind(
+            size=lambda o, v:
+            setattr(o, "text_size", v)
+        )
+
+        root.add_widget(title)
+
+        subtitle = Label(
+            text=ar(
+                "صوّر الفاتورة أو اختر صورة ثم راجع الحساب"
+            ),
+            font_name=ARABIC_FONT,
+            font_size=dp(16),
+            color=(0.78, 0.78, 0.78, 1),
+            size_hint_y=None,
+            height=dp(38),
+            halign="center",
+            valign="middle"
+        )
+
+        subtitle.bind(
+            size=lambda o, v:
+            setattr(o, "text_size", v)
+        )
+
+        root.add_widget(subtitle)
+
+        self.invoice_image = Image(
+            source="",
+            allow_stretch=True,
+            keep_ratio=True
+        )
+
+        root.add_widget(self.invoice_image)
+
+        image_buttons = BoxLayout(
+            orientation="horizontal",
+            spacing=dp(8),
+            size_hint_y=None,
+            height=dp(55)
+        )
+
+        camera_button = GoldButton(
+            text=ar("تصوير الفاتورة")
+        )
+
+        camera_button.bind(
+            on_release=lambda *_:
+            self.take_photo()
+        )
+
+        gallery_button = GoldButton(
+            text=ar("اختيار صورة")
+        )
+
+        gallery_button.bind(
+            on_release=lambda *_:
+            self.choose_image()
+        )
+
+        image_buttons.add_widget(camera_button)
+        image_buttons.add_widget(gallery_button)
+
+        root.add_widget(image_buttons)
+
+        self.calculate_button = GoldButton(
+            text=ar("فتح الحاسبة الذكية"),
+            size_hint_y=None,
+            height=dp(58)
+        )
+
+        self.calculate_button.bind(
+            on_release=lambda *_:
+            self.open_calculator()
+        )
+
+        root.add_widget(self.calculate_button)
+
+        clear_button = Button(
+            text=ar("مسح الفاتورة"),
+            font_name=ARABIC_FONT,
+            font_size=dp(15),
+            color=(0.82, 0.82, 0.82, 1),
+            background_normal="",
+            background_color=(0.12, 0.12, 0.12, 1),
+            size_hint_y=None,
+            height=dp(45)
+        )
+
+        clear_button.bind(
+            on_release=lambda *_:
+            self.clear_image()
+        )
+
+        root.add_widget(clear_button)
+
+        self.add_widget(root)
+
+    # ========================================================
+    # أدوات Android
+    # ========================================================
+
+    def get_android_activity(self):
+
+        try:
+            from jnius import autoclass
+
+            PythonActivity = autoclass(
+                "org.kivy.android.PythonActivity"
+            )
+
+            return PythonActivity.mActivity
+
+        except Exception:
+            return None
+
+    def get_intent_classes(self):
+
+        from jnius import autoclass
+
+        Intent = autoclass(
+            "android.content.Intent"
+        )
+
+        return Intent
+
+    # ========================================================
+    # الكاميرا
+    # ========================================================
+
+    def take_photo(self):
+
+        if platform != "android":
+            self.show_message(
+                "الكاميرا",
+                "هذه الخاصية تعمل على Android."
+            )
+            return
+
+        if self.waiting_for_camera:
+            return
+
+        try:
+
+            activity = self.get_android_activity()
+
+            if activity is None:
+                self.show_message(
+                    "الكاميرا",
+                    "تعذر الوصول إلى Activity الخاصة بـ Android."
+                )
+                return
+
+            Intent = self.get_intent_classes()
+
+            intent = Intent(
+                "android.media.action.IMAGE_CAPTURE"
+            )
+
+            package_manager = (
+                activity.getPackageManager()
+            )
+
+            resolver = intent.resolveActivity(
+                package_manager
+            )
+
+            if resolver is None:
+                self.show_message(
+                    "الكاميرا",
+                    "لا يوجد تطبيق كاميرا متاح على الهاتف."
+                )
+                return
+
+            self.waiting_for_camera = True
+
+            activity.startActivityForResult(
+                intent,
+                7101
+            )
+
+        except Exception as e:
+
+            self.waiting_for_camera = False
+
+            self.show_message(
+                "الكاميرا",
+                "تعذر تشغيل تطبيق الكاميرا.\n\n"
+                + str(e)
+            )
+
+    # ========================================================
+    # معرض الصور
+    # ========================================================
+
+    def choose_image(self):
+
+        if platform != "android":
+            self.show_message(
+                "الصور",
+                "هذه الخاصية تعمل على Android."
+            )
+            return
+
+        if self.waiting_for_gallery:
+            return
+
+        try:
+
+            activity = self.get_android_activity()
+
+            if activity is None:
+                self.show_message(
+                    "الصور",
+                    "تعذر الوصول إلى Android."
+                )
+                return
+
+            Intent = self.get_intent_classes()
+
+            intent = Intent(
+                "android.intent.action.OPEN_DOCUMENT"
+            )
+
+            intent.addCategory(
+                "android.intent.category.OPENABLE"
+            )
+
+            intent.setType("image/*")
+
+            package_manager = (
+                activity.getPackageManager()
+            )
+
+            resolver = intent.resolveActivity(
+                package_manager
+            )
+
+            if resolver is None:
+
+                intent = Intent(
+                    "android.intent.action.GET_CONTENT"
+                )
+
+                intent.addCategory(
+                    "android.intent.category.OPENABLE"
+                )
+
+                intent.setType("image/*")
+
+            self.waiting_for_gallery = True
+
+            activity.startActivityForResult(
+                intent,
+                7102
+            )
+
+        except Exception as e:
+
+            self.waiting_for_gallery = False
+
+            self.show_message(
+                "الصور",
+                "تعذر فتح معرض الصور.\n\n"
+                + str(e)
+            )
+
+    # ========================================================
+    # استقبال نتيجة Android
+    # ========================================================
+
+    def android_activity_result(
+        self,
+        request_code,
+        result_code,
+        intent
+    ):
+
+        try:
+
+            if result_code != -1:
+                self.waiting_for_camera = False
+                self.waiting_for_gallery = False
+                return
+
+            if request_code == 7101:
+
+                Clock.schedule_once(
+                    lambda dt:
+                    self.process_camera_result(intent),
+                    0.1
+                )
+
+                return
+
+            if request_code == 7102:
+
+                Clock.schedule_once(
+                    lambda dt:
+                    self.process_gallery_result(intent),
+                    0.1
+                )
+
+        except Exception as e:
+
+            self.waiting_for_camera = False
+            self.waiting_for_gallery = False
+
+            self.show_message(
+                "Android",
+                "حدث خطأ في استلام الصورة.\n\n"
+                + str(e)
+            )
+
+    # ========================================================
+    # معالجة صورة الكاميرا
+    # ========================================================
+
+    def process_camera_result(self, intent):
+
+        self.waiting_for_camera = False
+
+        try:
+
+            if intent is None:
+                raise Exception(
+                    "الكاميرا لم ترجع صورة."
+                )
+
+            extras = intent.getExtras()
+
+            if extras is None:
+                raise Exception(
+                    "لم ترجع الكاميرا بيانات الصورة."
+                )
+
+            bitmap = extras.get("data")
+
+            if bitmap is None:
+                raise Exception(
+                    "لم ترجع الكاميرا الصورة."
+                )
+
+            from jnius import autoclass
+
+            folder = (
+                App.get_running_app()
+                .user_data_dir
+            )
+
+            os.makedirs(
+                folder,
+                exist_ok=True
+            )
+
+            output_path = os.path.join(
+                folder,
+                "invoice_camera.jpg"
+            )
+
+            FileOutputStream = autoclass(
+                "java.io.FileOutputStream"
+            )
+
+            CompressFormat = autoclass(
+                "android.graphics.Bitmap$CompressFormat"
+            )
+
+            output_stream = FileOutputStream(
+                output_path
+            )
+
+            bitmap.compress(
+                CompressFormat.JPEG,
+                95,
+                output_stream
+            )
+
+            output_stream.flush()
+            output_stream.close()
+
+            try:
+                bitmap.recycle()
+            except Exception:
+                pass
+
+            if not os.path.exists(
+                output_path
+            ):
+                raise Exception(
+                    "تم التصوير ولكن لم يتم حفظ الصورة."
+                )
+
+            self.set_image(
+                output_path
+            )
+
+        except Exception as e:
+
+            self.show_message(
+                "الكاميرا",
+                "تعذر استلام صورة الكاميرا.\n\n"
+                + str(e)
+            )
+
+    # ========================================================
+    # معالجة صورة المعرض
+    # ========================================================
+
+    def process_gallery_result(self, intent):
+
+        self.waiting_for_gallery = False
+
+        try:
+
+            if intent is None:
+                raise Exception(
+                    "لم يتم اختيار صورة."
+                )
+
+            uri = intent.getData()
+
+            if uri is None:
+                raise Exception(
+                    "لم يتم اختيار صورة."
+                )
+
+            self.copy_uri_to_file(
+                uri
+            )
+
+        except Exception as e:
+
+            self.show_message(
+                "الصور",
+                "تعذر قراءة الصورة.\n\n"
+                + str(e)
+            )
+
+    # ========================================================
+    # نسخ الصورة المختارة إلى مجلد البرنامج
+    # ========================================================
+
+    def copy_uri_to_file(self, uri):
+
+        try:
+
+            from jnius import autoclass
+
+            activity = self.get_android_activity()
+
+            if activity is None:
+                raise Exception(
+                    "تعذر الوصول إلى Android."
+                )
+
+            resolver = (
+                activity.getContentResolver()
+            )
+
+            stream = resolver.openInputStream(
+                uri
+            )
+
+            if stream is None:
+                raise Exception(
+                    "تعذر فتح الصورة."
+                )
+
+            BitmapFactory = autoclass(
+                "android.graphics.BitmapFactory"
+            )
+
+            bitmap = BitmapFactory.decodeStream(
+                stream
+            )
+
+            stream.close()
+
+            if bitmap is None:
+                raise Exception(
+                    "تعذر قراءة صورة الفاتورة."
+                )
+
+            folder = (
+                App.get_running_app()
+                .user_data_dir
+            )
+
+            os.makedirs(
+                folder,
+                exist_ok=True
+            )
+
+            output_path = os.path.join(
+                folder,
+                "invoice_selected.jpg"
+            )
+
+            FileOutputStream = autoclass(
+                "java.io.FileOutputStream"
+            )
+
+            CompressFormat = autoclass(
+                "android.graphics.Bitmap$CompressFormat"
+            )
+
+            output_stream = FileOutputStream(
+                output_path
+            )
+
+            bitmap.compress(
+                CompressFormat.JPEG,
+                95,
+                output_stream
+            )
+
+            output_stream.flush()
+            output_stream.close()
+
+            try:
+                bitmap.recycle()
+            except Exception:
+                pass
+
+            if not os.path.exists(
+                output_path
+            ):
+                raise Exception(
+                    "تعذر حفظ الصورة."
+                )
+
+            self.set_image(
+                output_path
+            )
+
+        except Exception as e:
+
+            self.show_message(
+                "الصور",
+                "تعذر تجهيز الصورة للبرنامج.\n\n"
+                + str(e)
+            )
+
+    # ========================================================
+    # الصورة
+    # ========================================================
+
+    def set_image(self, path):
+
+        try:
+
+            if not path:
+                return
+
+            if not os.path.exists(path):
+                return
+
+            self.image_path = path
+
+            self.invoice_image.source = path
+            self.invoice_image.reload()
+
+        except Exception as e:
+
+            self.show_message(
+                "الصورة",
+                "تعذر عرض الصورة.\n\n"
+                + str(e)
+            )
+
+    def clear_image(self):
+
+        self.image_path = ""
+
+        self.invoice_image.source = ""
+
+        self.invoice_image.reload()
+
+    # ========================================================
+    # الحاسبة
+    # ========================================================
+
+    def open_calculator(self):
+
+        self.manager.current = "calculator"
+
+    # ========================================================
+    # الرسائل
+    # ========================================================
+
+    def show_message(
+        self,
+        title,
+        message
+    ):
+
+        label = Label(
+            text=ar(message),
+            font_name=ARABIC_FONT,
+            font_size=dp(15),
+            halign="center",
+            valign="middle",
+            color=(0.95, 0.95, 0.95, 1)
+        )
+
+        label.bind(
+            size=lambda o, v:
+            setattr(o, "text_size", v)
+        )
+
+        popup = Popup(
+            title=ar(title),
+            title_font=ARABIC_FONT,
+            content=label,
+            size_hint=(0.90, 0.52),
+            auto_dismiss=True
+        )
+
+        popup.open()
+
+
+# ============================================================
+# شاشة الحاسبة
+# ============================================================
+
+class CalculatorScreen(Screen):
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        main = BoxLayout(
+            orientation="vertical",
+            padding=[
+                dp(12),
+                dp(10),
+                dp(12),
+                dp(10)
+            ],
+            spacing=dp(8)
+        )
+
+        title = Label(
+            text=ar("حاسبة الفاتورة الذكية"),
+            font_name=ARABIC_FONT,
+            font_size=dp(24),
+            bold=True,
+            color=(0.95, 0.72, 0.15, 1),
+            size_hint_y=None,
+            height=dp(48),
+            halign="center",
+            valign="middle"
+        )
+
+        title.bind(
+            size=lambda o, v:
+            setattr(o, "text_size", v)
+        )
+
+        main.add_widget(title)
+
+        info = Label(
+            text=ar(
+                "أدخل السعر والكمية — والحساب يتم تلقائيًا"
+            ),
+            font_name=ARABIC_FONT,
+            font_size=dp(14),
+            color=(0.72, 0.72, 0.72, 1),
+            size_hint_y=None,
+            height=dp(30),
+            halign="center",
+            valign="middle"
+        )
+
+        info.bind(
+            size=lambda o, v:
+            setattr(o, "text_size", v)
+        )
+
+        main.add_widget(info)
+
+        invoice_info = BoxLayout(
+            orientation="horizontal",
+            spacing=dp(6),
+            size_hint_y=None,
+            height=dp(48)
+        )
+
+        self.invoice_number = TextInput(
+            hint_text=ar("رقم الفاتورة"),
+            font_name=ARABIC_FONT,
+            font_size=dp(13),
+            multiline=False,
+            halign="center",
+            background_normal="",
+            background_color=(0.10, 0.10, 0.10, 1),
+            foreground_color=(1, 1, 1, 1),
+            hint_text_color=(0.55, 0.55, 0.55, 1)
+        )
+
+        self.customer_name = TextInput(
+            hint_text=ar("اسم العميل"),
+            font_name=ARABIC_FONT,
+            font_size=dp(13),
+            multiline=False,
+            halign="center",
+            background_normal="",
+            background_color=(0.10, 0.10, 0.10, 1),
+            foreground_color=(1, 1, 1, 1),
+            hint_text_color=(0.55, 0.55, 0.55, 1)
+        )
+
+        invoice_info.add_widget(
+            self.invoice_number
+        )
+
+        invoice_info.add_widget(
+            self.customer_name
+        )
+
+        main.add_widget(
+            invoice_info
+        )
+
+        header = GridLayout(
+            cols=4,
+            size_hint_y=None,
+            height=dp(38),
+            spacing=dp(3)
+        )
+
+        for text in [
+            "البند",
+            "السعر",
+            "الكمية",
+            "الإجمالي"
+        ]:
+
+            header.add_widget(
+                Label(
+                    text=ar(text),
+                    font_name=ARABIC_FONT,
+                    font_size=dp(13),
+                    bold=True,
+                    color=(
+                        0.95,
+                        0.72,
+                        0.15,
+                        1
+                    ),
+                    halign="center",
+                    valign="middle"
+                )
+            )
+
+        main.add_widget(header)
+
+        scroll = ScrollView(
+            bar_width=dp(4),
+            scroll_type=[
+                "bars",
+                "content"
+            ]
+        )
+
+        self.rows_container = GridLayout(
+            cols=1,
+            spacing=dp(6),
+            size_hint_y=None,
+            padding=[
+                0,
+                dp(2),
+                0,
+                dp(2)
+            ]
+        )
+
+        self.rows_container.bind(
+            minimum_height=
+            self.rows_container.setter(
+                "height"
+            )
+        )
+
+        scroll.add_widget(
+            self.rows_container
+        )
+
+        main.add_widget(scroll)
+
+        row_actions = BoxLayout(
+            orientation="horizontal",
+            spacing=dp(6),
+            size_hint_y=None,
+            height=dp(46)
+        )
+
+        add_button = GoldButton(
+            text=ar("＋ إضافة بند")
+        )
+
+        add_button.font_size = dp(14)
+
+        add_button.bind(
+            on_release=lambda *_:
+            self.add_row()
+        )
+
+        clear_rows_button = Button(
+            text=ar("مسح البنود"),
+            font_name=ARABIC_FONT,
+            font_size=dp(14),
+            bold=True,
+            color=(0.90, 0.90, 0.90, 1),
+            background_normal="",
+            background_color=(
+                0.18,
+                0.18,
+                0.18,
+                1
+            )
+        )
+
+        clear_rows_button.bind(
+            on_release=lambda *_:
+            self.reset_rows()
+        )
+
+        row_actions.add_widget(
+            add_button
+        )
+
+        row_actions.add_widget(
+            clear_rows_button
+        )
+
+        main.add_widget(
+            row_actions
+        )
+
+        summary = GridLayout(
+            cols=2,
+            spacing=dp(5),
+            size_hint_y=None,
+            height=dp(112)
+        )
+
+        summary.add_widget(
+            self._summary_title("المجموع")
+        )
+
+        self.subtotal_value = (
+            self._summary_value("0 جنيه")
+        )
+
+        summary.add_widget(
+            self.subtotal_value
+        )
+
+        summary.add_widget(
+            self._summary_title("الخصم")
+        )
+
+        self.discount_input = (
+            self._summary_input("0")
+        )
+
+        summary.add_widget(
+            self.discount_input
+        )
+
+        summary.add_widget(
+            self._summary_title("الضريبة %")
+        )
+
+        self.tax_input = (
+            self._summary_input("0")
+        )
+
+        summary.add_widget(
+            self.tax_input
+        )
+
+        summary.add_widget(
+            self._summary_title("المدفوع")
+        )
+
+        self.paid_input = (
+            self._summary_input("0")
+        )
+
+        summary.add_widget(
+            self.paid_input
+        )
+
+        main.add_widget(summary)
+
+        self.discount_input.bind(
+            text=lambda *_:
+            self.calculate_total()
+        )
+
+        self.tax_input.bind(
+            text=lambda *_:
+            self.calculate_total()
+        )
+
+        self.paid_input.bind(
+            text=lambda *_:
+            self.calculate_total()
+        )
+
+        result_box = BoxLayout(
+            orientation="horizontal",
+            spacing=dp(4),
+            size_hint_y=None,
+            height=dp(62)
+        )
+
+        self.total_label = Label(
+            text=ar(
+                "الإجمالي: 0 جنيه"
+            ),
+            font_name=ARABIC_FONT,
+            font_size=dp(20),
+            bold=True,
+            color=(
+                0.95,
+                0.72,
+                0.15,
+                1
+            ),
+            halign="center",
+            valign="middle"
+        )
+
+        self.total_label.bind(
+            size=lambda o, v:
+            setattr(o, "text_size", v)
+        )
+
+        self.remaining_label = Label(
+            text=ar(
+                "الباقي: 0 جنيه"
+            ),
+            font_name=ARABIC_FONT,
+            font_size=dp(17),
+            bold=True,
+            color=(
+                0.85,
+                0.85,
+                0.85,
+                1
+            ),
+            halign="center",
+            valign="middle"
+        )
+
+        self.remaining_label.bind(
+            size=lambda o, v:
+            setattr(o, "text_size", v)
+        )
+
+        result_box.add_widget(
+            self.total_label
+        )
+
+        result_box.add_widget(
+            self.remaining_label
+        )
+
+        main.add_widget(
+            result_box
+        )
+
+        bottom = BoxLayout(
+            orientation="horizontal",
+            spacing=dp(6),
+            size_hint_y=None,
+            height=dp(48)
+        )
+
+        calculate_button = GoldButton(
+            text=ar("احسب الآن")
+        )
+
+        calculate_button.bind(
+            on_release=lambda *_:
+            self.calculate_total()
+        )
+
+        back_button = Button(
+            text=ar("العودة"),
+            font_name=ARABIC_FONT,
+            font_size=dp(14),
+            bold=True,
+            color=(0.90, 0.90, 0.90, 1),
+            background_normal="",
+            background_color=(
+                0.18,
+                0.18,
+                0.18,
+                1
+            )
+        )
+
+        back_button.bind(
+            on_release=lambda *_:
+            setattr(
+                self.manager,
+                "current",
+                "home"
+            )
+        )
+
+        bottom.add_widget(
+            calculate_button
+        )
+
+        bottom.add_widget(
+            back_button
+        )
+
+        main.add_widget(bottom)
+
+        self.add_widget(main)
+
+        self.rows = []
+
+        self.reset_rows()
+
+    # ========================================================
+    # عناصر الملخص
+    # ========================================================
+
+    def _summary_title(self, text):
+
+        return Label(
+            text=ar(text),
+            font_name=ARABIC_FONT,
+            font_size=dp(13),
+            bold=True,
+            color=(
+                0.78,
+                0.78,
+                0.78,
+                1
+            ),
+            halign="center",
+            valign="middle"
+        )
+
+    def _summary_value(self, text):
+
+        label = Label(
+            text=ar(text),
+            font_name=ARABIC_FONT,
+            font_size=dp(14),
+            bold=True,
+            color=(
+                0.95,
+                0.72,
+                0.15,
+                1
+            ),
+            halign="center",
+            valign="middle"
+        )
+
+        label.bind(
+            size=lambda o, v:
+            setattr(o, "text_size", v)
+        )
+
+        return label
+
+    def _summary_input(self, text):
+
+        return TextInput(
+            text=text,
+            font_name=ARABIC_FONT,
+            font_size=dp(14),
+            multiline=False,
+            input_filter="float",
+            halign="center",
+            background_normal="",
+            background_color=(
+                0.10,
+                0.10,
+                0.10,
+                1
+            ),
+            foreground_color=(
+                1,
+                1,
+                1,
+                1
+            )
+        )
+
+    # ========================================================
+    # البنود
+    # ========================================================
+
+    def reset_rows(self):
+
+        self.rows_container.clear_widgets()
+
+        self.rows = []
+
+        for _ in range(5):
+            self.add_row()
+
+        self.calculate_total()
+
+    def add_row(self):
+
+        number = len(self.rows) + 1
+
+        row = BoxLayout(
+            orientation="horizontal",
+            spacing=dp(4),
+            size_hint_y=None,
+            height=dp(48)
+        )
+
+        item = TextInput(
+            text="",
+            hint_text=str(number),
+            font_name=ARABIC_FONT,
+            font_size=dp(13),
+            multiline=False,
+            halign="center",
+            background_normal="",
+            background_color=(
+                0.10,
+                0.10,
+                0.10,
+                1
+            ),
+            foreground_color=(
+                1,
+                1,
+                1,
+                1
+            ),
+            hint_text_color=(
+                0.45,
+                0.45,
+                0.45,
+                1
+            )
+        )
+
+        price = TextInput(
+            text="",
+            hint_text="0",
+            font_name=ARABIC_FONT,
+            font_size=dp(14),
+            multiline=False,
+            input_filter="float",
+            halign="center",
+            background_normal="",
+            background_color=(
+                0.10,
+                0.10,
+                0.10,
+                1
+            ),
+            foreground_color=(
+                1,
+                1,
+                1,
+                1
+            ),
+            hint_text_color=(
+                0.45,
+                0.45,
+                0.45,
+                1
+            )
+        )
+
+        quantity = TextInput(
+            text="",
+            hint_text="1",
+            font_name=ARABIC_FONT,
+            font_size=dp(14),
+            multiline=False,
+            input_filter="float",
+            halign="center",
+            background_normal="",
+            background_color=(
+                0.10,
+                0.10,
+                0.10,
+                1
+            ),
+            foreground_color=(
+                1,
+                1,
+                1,
+                1
+            ),
+            hint_text_color=(
+                0.45,
+                0.45,
+                0.45,
+                1
+            )
+        )
+
+        result = Label(
+            text="0",
+            font_name=ARABIC_FONT,
+            font_size=dp(14),
+            bold=True,
+            color=(
+                0.95,
+                0.72,
+                0.15,
+                1
+            ),
+            halign="center",
+            valign="middle"
+        )
+
+        result.bind(
+            size=lambda o, v:
+            setattr(o, "text_size", v)
+        )
+
+        row.add_widget(item)
+        row.add_widget(price)
+        row.add_widget(quantity)
+        row.add_widget(result)
+
+        self.rows_container.add_widget(row)
+
+        data = {
+            "item": item,
+            "price": price,
+            "quantity": quantity,
+            "result": result
+        }
+
+        self.rows.append(data)
+
+        price.bind(
+            text=lambda *_:
+            self.update_row(
+                price,
+                quantity,
+                result
+            )
+        )
+
+        quantity.bind(
+            text=lambda *_:
+            self.update_row(
+                price,
+                quantity,
+                result
+            )
+        )
+
+    def update_row(
+        self,
+        price,
+        quantity,
+        result
+    ):
+
+        p = number_value(
+            price.text
+        )
+
+        q = number_value(
+            quantity.text
+        )
+
+        value = p * q
+
+        if value == int(value):
+            result.text = str(
+                int(value)
+            )
+        else:
+            result.text = "{:.2f}".format(
+                value
+            )
+
+        self.calculate_total()
+
+    # ========================================================
+    # الحساب
+    # ========================================================
+
+    def calculate_total(self):
+
+        subtotal = 0.0
+
+        for row in self.rows:
+
+            p = number_value(
+                row["price"].text
+            )
+
+            q = number_value(
+                row["quantity"].text
+            )
+
+            subtotal += p * q
+
+        discount = number_value(
+            self.discount_input.text
+        )
+
+        tax_percent = number_value(
+            self.tax_input.text
+        )
+
+        paid = number_value(
+            self.paid_input.text
+        )
+
+        if discount < 0:
+            discount = 0.0
+
+        if discount > subtotal:
+            discount = subtotal
+
+        after_discount = (
+            subtotal - discount
+        )
+
+        tax = (
+            after_discount *
+            (tax_percent / 100.0)
+        )
+
+        total = (
+            after_discount + tax
+        )
+
+        remaining = (
+            total - paid
+        )
+
+        self.subtotal_value.text = ar(
+            self._money(subtotal)
+            + " جنيه"
+        )
+
+        self.total_label.text = ar(
+            "الإجمالي: "
+            + self._money(total)
+            + " جنيه"
+        )
+
+        if remaining < 0:
+
+            self.remaining_label.text = ar(
+                "المرتجع: "
+                + self._money(
+                    abs(remaining)
+                )
+                + " جنيه"
+            )
+
+        else:
+
+            self.remaining_label.text = ar(
+                "الباقي: "
+                + self._money(remaining)
+                + " جنيه"
+            )
+
+    def _money(self, value):
+
+        if abs(
+            value - int(value)
+        ) < 0.000001:
+
+            return str(
+                int(value)
+            )
+
+        return "{:.2f}".format(value)
+
+
+# ============================================================
+# التطبيق
+# ============================================================
+
+class InvoiceCalculatorApp(App):
+
+    def build(self):
+
+        self.title = APP_NAME
+
+        manager = ScreenManager()
+
+        manager.add_widget(
+            HomeScreen(name="home")
+        )
+
+        manager.add_widget(
+            CalculatorScreen(
+                name="calculator"
+            )
+        )
+
+        if platform == "android":
+
+            try:
+                from android import activity
+
+                home = manager.get_screen(
+                    "home"
+                )
+
+                activity.bind(
+                    on_activity_result=
+                    home.android_activity_result
+                )
+
+            except Exception:
+                pass
+
+        return manager
+
+    def on_stop(self):
+
+        if platform == "android":
+
+            try:
+                from android import activity
+
+                home = (
+                    self.root.get_screen(
+                        "home"
+                    )
+                )
+
+                activity.unbind(
+                    on_activity_result=
+                    home.android_activity_result
+                )
+
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+
+    InvoiceCalculatorApp().run()
